@@ -234,12 +234,16 @@ function initAudio(){
   audioCtx.decodeAudioData(b64ToArrayBuffer(CASH_B64), b=>{ cashBuf=b; }, ()=>{});
   audioCtx.decodeAudioData(b64ToArrayBuffer(BELL_B64), b=>{ bellBuf=b; }, ()=>{});
 }
-function unlockAudio(){ initAudio(); if(audioCtx.state === "suspended") audioCtx.resume(); }
+function unlockAudio(){ initAudio(); if(audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); } }
 function playBuf(buf){
   if(!audioCtx || !buf) return;
-  if(audioCtx.state === "suspended") audioCtx.resume();
-  master.gain.value = cfg.volume;
-  const s = audioCtx.createBufferSource(); s.buffer = buf; s.connect(master); s.start();
+  const doPlay = () => {
+    if(!audioCtx || audioCtx.state !== "running" || !buf) return;
+    master.gain.value = cfg.volume;
+    const s = audioCtx.createBufferSource(); s.buffer = buf; s.connect(master); s.start();
+  };
+  if(audioCtx.state === "running"){ doPlay(); }
+  else { (audioCtx.resume() || Promise.resolve()).then(doPlay).catch(()=>{}); }
 }
 function playCash(){ playBuf(cashBuf); }
 function playBell(){ playBuf(bellBuf); }
@@ -321,7 +325,8 @@ function endBreak(){
 function start(){
   unlockAudio();
   if(st.phase === "done") st = freshState();
-  if(!st.begun){ st.begun = true; st._round = 1; playCash(); }   // 首次开始:点钞(证明开始了)
+  if(!st.begun){ st.begun = true; st._round = 1; }
+  playCash();                                          // 首次开始 & 每次恢复都点钞(证明已开始/已继续)
   st.running = true; autoPaused = false; st.lastTick = Date.now();
   startTicker(); render();
 }
@@ -390,7 +395,15 @@ $("testCash").addEventListener("click", () => { unlockAudio(); if(master) master
 $("testBell").addEventListener("click", () => { unlockAudio(); if(master) master.gain.value = parseFloat(sEl.volume.value); playBell(); });
 $("volume").addEventListener("input", () => { if(master) master.gain.value = parseFloat(sEl.volume.value); });
 
-document.addEventListener("visibilitychange", () => { if(document.visibilityState === "visible" && st.running) tick(); });
+document.addEventListener("visibilitychange", () => {
+  if(document.visibilityState === "visible"){
+    if(audioCtx && audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); }  // 回前台先把音频唤回 running
+    if(st.running) tick();
+  }
+});
+window.addEventListener("pageshow", () => {
+  if(audioCtx && audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); }     // 覆盖 BFCache/PWA 恢复
+});
 document.addEventListener("keydown", e => {
   if(el.overlay.classList.contains("open")) return;
   if(e.code === "Space"){ e.preventDefault(); toggle(); }

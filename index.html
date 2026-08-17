@@ -235,18 +235,23 @@ function initAudio(){
   audioCtx.decodeAudioData(b64ToArrayBuffer(BELL_B64), b=>{ bellBuf=b; }, ()=>{});
 }
 function unlockAudio(){ initAudio(); if(audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); } }
-function playBuf(buf){
+function playBuf(buf, delaySec){
   if(!audioCtx || !buf) return;
   const doPlay = () => {
     if(!audioCtx || audioCtx.state !== "running" || !buf) return;
     master.gain.value = cfg.volume;
-    const s = audioCtx.createBufferSource(); s.buffer = buf; s.connect(master); s.start();
+    const s = audioCtx.createBufferSource(); s.buffer = buf; s.connect(master);
+    s.start(audioCtx.currentTime + (delaySec > 0 ? delaySec : 0));   // 由音频线程精确排期,不靠主线程 tick
   };
   if(audioCtx.state === "running"){ doPlay(); }
   else { (audioCtx.resume() || Promise.resolve()).then(doPlay).catch(()=>{}); }
 }
 function playCash(){ playBuf(cashBuf); }
 function playBell(){ playBuf(bellBuf); }
+function playPair(){
+  playBuf(cashBuf, 0);              // 闭眼:立即
+  playBuf(cashBuf, cfg.eyeSec);     // 睁眼:音频线程精确 eyeSec 秒后,不受后台标签页节流影响
+}
 
 /* ---------------- state ---------------- */
 let st = freshState();
@@ -289,13 +294,8 @@ function tick(){
       const elapsed = st.totalMs - st.remainingMs;
       // 响铃只叠加事件:不停表、不换字
       while(st.nextRingAt != null && elapsed >= st.nextRingAt && st.remainingMs > 0){
-        playCash();                                    // 点钞:闭眼 / 睁眼 都是这一声
-        if(st.ringStage === "first"){
-          st.nextRingAt += cfg.eyeSec*1000;            // 7秒后第二响(睁眼)
-          st.ringStage = "second";
-        }else{
-          scheduleNextPair(st, elapsed);               // 排下一组
-        }
+        playPair();                                    // 一组两响(闭眼 + eyeSec 秒后睁眼),间隔由音频时钟保证
+        scheduleNextPair(st, st.nextRingAt + cfg.eyeSec*1000);   // 从本组睁眼时刻起算下一组随机间隔
       }
     }
   }else if(st.phase === "break"){

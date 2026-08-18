@@ -205,6 +205,15 @@ function loadCfg(){
 function saveCfg(){ try{ localStorage.setItem(STORE_KEY, JSON.stringify(cfg)); }catch(e){} }
 let cfg = loadCfg();
 
+/* ---------------- session persistence + long-idle auto-reload ---------------- */
+const SESSION_KEY = "randomChime.session.v1";
+const SESSION_MAX_AGE_MS = 12*3600*1000;    // 存档超过12小时视为过期,不还原
+const RELOAD_IDLE_MS = 15*60000;            // 空闲≥15分钟回前台 → 自动刷新换新音频引擎(Safari 冻结后 resume 救不活)
+let hiddenAt = 0, reloading = false;
+function saveSession(){ try{ localStorage.setItem(SESSION_KEY, JSON.stringify({ st, autoPaused, savedAt: Date.now() })); }catch(e){} }
+function loadSession(){ try{ const s = JSON.parse(localStorage.getItem(SESSION_KEY) || "null"); return (s && s.st && (Date.now()-s.savedAt) < SESSION_MAX_AGE_MS) ? s : null; }catch(e){ return null; } }
+function hardReload(){ if(reloading) return; reloading = true; saveSession(); location.reload(); }  // 整页刷新=全新音频引擎;进度已存,还原后不丢
+
 const ACCENTS = {
   focus:{ c:"#e6a94d", soft:"#e6a94d55" },
   break:{ c:"#c98a58", soft:"#c98a5844" },
@@ -309,30 +318,38 @@ function enterBreak(){
   playBell();                                          // 40分钟结束:钟声一次
   if(cfg.bigRestMin <= 0){ endBreak(); return; }
   st.phase = "break"; st.totalMs = cfg.bigRestMin*60000; st.remainingMs = st.totalMs; st.nextRingAt = null;
-  applyAccent();
+  applyAccent(); saveSession();
 }
 function endBreak(){
   if(cfg.rounds !== 0 && (st._round||1) >= cfg.rounds){
-    st.phase = "done"; st.running = false; stopTicker(); applyAccent(); render(); return;
+    st.phase = "done"; st.running = false; stopTicker(); applyAccent(); render(); saveSession(); return;
   }
   st._round = (st._round||1) + 1;
   st.phase = "focus"; st.totalMs = cfg.focusMin*60000; st.remainingMs = st.totalMs;
   scheduleNextPair(st, 0); applyAccent();
   playCash();                                          // 大休息结束 → 自动开始下一轮:点钞
+  saveSession();
 }
 
 /* ---------------- controls ---------------- */
 function start(){
   unlockAudio();
+  if(audioCtx && audioCtx.state !== "running"){        // resume 后仍非 running:可能只是慢,也可能引擎已被系统拆掉
+    setTimeout(() => {                                  // 给健康引擎充足时间恢复,避免误刷新
+      if(!audioCtx || audioCtx.state === "running") return;
+      (audioCtx.resume() || Promise.resolve()).catch(()=>{});                                // 再试一次唤醒
+      setTimeout(() => { if(audioCtx && audioCtx.state !== "running") hardReload(); }, 600);  // 共约1.2s仍唤不醒→判定已死,刷新换新引擎(进度已存,再点一次即出声)
+    }, 600);
+  }
   if(st.phase === "done") st = freshState();
   if(!st.begun){ st.begun = true; st._round = 1; }
   playCash();                                          // 首次开始 & 每次恢复都点钞(证明已开始/已继续)
   st.running = true; autoPaused = false; st.lastTick = Date.now();
-  startTicker(); render();
+  startTicker(); render(); saveSession();
 }
-function pause(auto){ st.running = false; autoPaused = !!auto; stopTicker(); render(); }
+function pause(auto){ st.running = false; autoPaused = !!auto; stopTicker(); render(); saveSession(); }
 function toggle(){ st.running ? pause(false) : start(); }
-function reset(){ st.running = false; autoPaused = false; stopTicker(); st = freshState(); applyAccent(); render(); }
+function reset(){ st.running = false; autoPaused = false; stopTicker(); st = freshState(); applyAccent(); render(); saveSession(); }
 function startTicker(){ if(!ticker) ticker = setInterval(tick, 250); }
 function stopTicker(){ if(ticker){ clearInterval(ticker); ticker = null; } }
 
@@ -396,14 +413,18 @@ $("testBell").addEventListener("click", () => { unlockAudio(); if(master) master
 $("volume").addEventListener("input", () => { if(master) master.gain.value = parseFloat(sEl.volume.value); });
 
 document.addEventListener("visibilitychange", () => {
-  if(document.visibilityState === "visible"){
-    if(audioCtx && audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); }  // 回前台先把音频唤回 running
-    if(st.running) tick();
-  }
+  if(document.visibilityState === "hidden"){ hiddenAt = Date.now(); saveSession(); return; }  // 进入后台:记时刻+存档
+  if(hiddenAt && Date.now()-hiddenAt >= RELOAD_IDLE_MS){ hardReload(); return; }               // 空闲≥15分钟→换新音频引擎
+  hiddenAt = 0;
+  if(audioCtx && audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); }  // 短暂离开:resume 常能救活,不必刷新
+  if(st.running) tick();
 });
-window.addEventListener("pageshow", () => {
-  if(audioCtx && audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); }     // 覆盖 BFCache/PWA 恢复
+window.addEventListener("pageshow", () => {                       // 覆盖 BFCache/PWA 恢复
+  if(hiddenAt && Date.now()-hiddenAt >= RELOAD_IDLE_MS){ hardReload(); return; }
+  hiddenAt = 0;
+  if(audioCtx && audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); }
 });
+window.addEventListener("pagehide", () => { hiddenAt = Date.now(); saveSession(); });
 document.addEventListener("keydown", e => {
   if(el.overlay.classList.contains("open")) return;
   if(e.code === "Space"){ e.preventDefault(); toggle(); }
@@ -411,6 +432,8 @@ document.addEventListener("keydown", e => {
 
 /* ---------------- init ---------------- */
 initAudio();          // 提前建好(挂起)音频上下文并解码,首次点击即可发声
+const _saved = loadSession();
+if(_saved){ st = _saved.st; autoPaused = !!_saved.autoPaused; st.running = false; }  // 还原上次进度为「暂停」态(刷新后不丢 26/40)
 applyAccent();
 render();
 </script>

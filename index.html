@@ -208,8 +208,7 @@ let cfg = loadCfg();
 /* ---------------- session persistence + long-idle auto-reload ---------------- */
 const SESSION_KEY = "randomChime.session.v1";
 const SESSION_MAX_AGE_MS = 12*3600*1000;    // 存档超过12小时视为过期,不还原
-const RELOAD_IDLE_MS = 15*60000;            // 空闲≥15分钟回前台 → 自动刷新换新音频引擎(Safari 冻结后 resume 救不活)
-let hiddenAt = 0, reloading = false;
+let reloading = false;
 function saveSession(){ try{ localStorage.setItem(SESSION_KEY, JSON.stringify({ st, autoPaused, savedAt: Date.now() })); }catch(e){} }
 function loadSession(){ try{ const s = JSON.parse(localStorage.getItem(SESSION_KEY) || "null"); return (s && s.st && (Date.now()-s.savedAt) < SESSION_MAX_AGE_MS) ? s : null; }catch(e){ return null; } }
 function hardReload(){ if(reloading) return; reloading = true; saveSession(); location.reload(); }  // 整页刷新=全新音频引擎;进度已存,还原后不丢
@@ -229,19 +228,30 @@ el.ring.style.strokeDasharray = RING_C;
 
 /* ---------------- audio (只在响的一瞬发声,平时完全静音) ---------------- */
 let audioCtx=null, master=null, cashBuf=null, bellBuf=null;
+let audioTouchedAt = 0;                       // 最近一次「引擎确实活着」的时刻(建 ctx 或成功发声);用于判断是否需换新引擎
+const REBUILD_IDLE_MS = 120000;              // 空闲≥2分钟再点开始 → 先重建全新音频引擎(旧引擎可能已被系统拆掉,且 state 会撒谎报 running)
 function b64ToArrayBuffer(b64){
   const bin = atob(b64), len = bin.length, bytes = new Uint8Array(len);
   for(let i=0;i<len;i++) bytes[i] = bin.charCodeAt(i);
   return bytes.buffer;
 }
-function initAudio(){
-  if(audioCtx) return;
+function buildAudio(){                        // 造一个全新引擎(在用户手势内调用即可立刻发声)
   const AC = window.AudioContext || window.webkitAudioContext;
   audioCtx = new AC();
   master = audioCtx.createGain(); master.gain.value = cfg.volume; master.connect(audioCtx.destination);
+  audioTouchedAt = Date.now();
   // 挂起状态即可解码,提前备好缓冲,首次点击就能立刻响
   audioCtx.decodeAudioData(b64ToArrayBuffer(CASH_B64), b=>{ cashBuf=b; }, ()=>{});
   audioCtx.decodeAudioData(b64ToArrayBuffer(BELL_B64), b=>{ bellBuf=b; }, ()=>{});
+}
+function initAudio(){ if(audioCtx) return; buildAudio(); }
+function rebuildAudio(){                       // 换新引擎:先 close 旧的(避开 Safari 每页 ~4 个 context 上限),再造新的
+  const old = audioCtx;
+  audioCtx = null;
+  try{ if(old) old.close(); }catch(e){}
+  buildAudio();
+  // 旧的已解码 cashBuf/bellBuf 仍保留引用,AudioBuffer 可跨 context 使用 → 新引擎当场就能响;
+  // buildAudio 里新引擎重新解码回来后会自动替换,供后续响铃用。
 }
 function unlockAudio(){ initAudio(); if(audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); } }
 function playBuf(buf, delaySec){
@@ -251,6 +261,7 @@ function playBuf(buf, delaySec){
     master.gain.value = cfg.volume;
     const s = audioCtx.createBufferSource(); s.buffer = buf; s.connect(master);
     s.start(audioCtx.currentTime + (delaySec > 0 ? delaySec : 0));   // 由音频线程精确排期,不靠主线程 tick
+    audioTouchedAt = Date.now();                                     // 真正发过声 → 刷新「引擎活着」时刻
   };
   if(audioCtx.state === "running"){ doPlay(); }
   else { (audioCtx.resume() || Promise.resolve()).then(doPlay).catch(()=>{}); }
@@ -333,18 +344,20 @@ function endBreak(){
 
 /* ---------------- controls ---------------- */
 function start(){
-  unlockAudio();
-  if(audioCtx && audioCtx.state !== "running"){        // resume 后仍非 running:可能只是慢,也可能引擎已被系统拆掉
-    setTimeout(() => {                                  // 给健康引擎充足时间恢复,避免误刷新
+  const now = Date.now();
+  if(!audioCtx || now - audioTouchedAt >= REBUILD_IDLE_MS) rebuildAudio();  // 空闲≥2分钟:在点击手势内直接换新引擎 → 一定能出声(不信任 state、不依赖 visibility)
+  unlockAudio();                                        // 新 ctx / 短暂空闲的旧 ctx 在此 resume
+  if(audioCtx && audioCtx.state !== "running"){         // 最终兜底:连新引擎都唤不醒 = 真·设备死 → 整页刷新(进度已存,再点一次即出声)
+    setTimeout(() => {
       if(!audioCtx || audioCtx.state === "running") return;
-      (audioCtx.resume() || Promise.resolve()).catch(()=>{});                                // 再试一次唤醒
-      setTimeout(() => { if(audioCtx && audioCtx.state !== "running") hardReload(); }, 600);  // 共约1.2s仍唤不醒→判定已死,刷新换新引擎(进度已存,再点一次即出声)
+      (audioCtx.resume() || Promise.resolve()).catch(()=>{});
+      setTimeout(() => { if(audioCtx && audioCtx.state !== "running") hardReload(); }, 600);
     }, 600);
   }
   if(st.phase === "done") st = freshState();
   if(!st.begun){ st.begun = true; st._round = 1; }
-  playCash();                                          // 首次开始 & 每次恢复都点钞(证明已开始/已继续)
-  st.running = true; autoPaused = false; st.lastTick = Date.now();
+  playCash();                                          // 首次开始 & 每次恢复都点钞(证明引擎活着/已继续)
+  st.running = true; autoPaused = false; st.lastTick = now;
   startTicker(); render(); saveSession();
 }
 function pause(auto){ st.running = false; autoPaused = !!auto; stopTicker(); render(); saveSession(); }
@@ -413,18 +426,14 @@ $("testBell").addEventListener("click", () => { unlockAudio(); if(master) master
 $("volume").addEventListener("input", () => { if(master) master.gain.value = parseFloat(sEl.volume.value); });
 
 document.addEventListener("visibilitychange", () => {
-  if(document.visibilityState === "hidden"){ hiddenAt = Date.now(); saveSession(); return; }  // 进入后台:记时刻+存档
-  if(hiddenAt && Date.now()-hiddenAt >= RELOAD_IDLE_MS){ hardReload(); return; }               // 空闲≥15分钟→换新音频引擎
-  hiddenAt = 0;
-  if(audioCtx && audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); }  // 短暂离开:resume 常能救活,不必刷新
+  if(document.visibilityState === "hidden"){ saveSession(); return; }                          // 进入后台:存档(长空闲后的换新引擎改由「点开始时重建」负责)
+  if(audioCtx && audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); }  // 回前台:短暂离开 resume 常能救活
   if(st.running) tick();
 });
 window.addEventListener("pageshow", () => {                       // 覆盖 BFCache/PWA 恢复
-  if(hiddenAt && Date.now()-hiddenAt >= RELOAD_IDLE_MS){ hardReload(); return; }
-  hiddenAt = 0;
   if(audioCtx && audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); }
 });
-window.addEventListener("pagehide", () => { hiddenAt = Date.now(); saveSession(); });
+window.addEventListener("pagehide", () => { saveSession(); });
 document.addEventListener("keydown", e => {
   if(el.overlay.classList.contains("open")) return;
   if(e.code === "Space"){ e.preventDefault(); toggle(); }

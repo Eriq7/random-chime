@@ -2,7 +2,8 @@
 const { test, expect } = require("@playwright/test");
 const path = require("path");
 
-const APP_URL = "file://" + path.join(__dirname, "..", "index.html");
+// 默认测本地文件;APP_URL=https://random-chime.vercel.app/ npm test 可直接测线上版本
+const APP_URL = process.env.APP_URL || "file://" + path.join(__dirname, "..", "index.html");
 
 async function openApp(page){
   await page.clock.install({ time: new Date("2026-10-19T10:00:00") });

@@ -1,0 +1,11 @@
+{
+  "name": "random-chime",
+  "private": true,
+  "description": "随机提示音 —— 单文件 index.html;这里只放测试工具",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.1"
+  }
+}

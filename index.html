@@ -196,7 +196,7 @@ const DEFAULTS = {
   volume: 0.8,
 };
 const STORE_KEY = "randomChime.settings.v3";
-const INACTIVITY_MS = 120000;       // >2分钟无活动(合盖/切走) → 自动暂停
+const SLEEP_PAUSE_MS = 120000;      // Mac 真睡着 ≥2分钟(合盖) → 自动暂停;只是切到后台被节流不算
 
 function loadCfg(){
   try{ return Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem(STORE_KEY) || "{}")); }
@@ -228,6 +228,7 @@ el.ring.style.strokeDasharray = RING_C;
 
 /* ---------------- audio (只在响的一瞬发声,平时完全静音) ---------------- */
 let audioCtx=null, master=null, cashBuf=null, bellBuf=null;
+let armed = [];                               // 提前排进音频时钟、还没响的声音 {s, at};暂停/重置时取消
 let audioTouchedAt = 0;                       // 最近一次「引擎确实活着」的时刻(建 ctx 或成功发声);用于判断是否需换新引擎
 const REBUILD_IDLE_MS = 120000;              // 空闲≥2分钟再点开始 → 先重建全新音频引擎(旧引擎可能已被系统拆掉,且 state 会撒谎报 running)
 function b64ToArrayBuffer(b64){
@@ -258,66 +259,79 @@ function playBuf(buf, delaySec){
   if(!audioCtx || !buf) return;
   const doPlay = () => {
     if(!audioCtx || audioCtx.state !== "running" || !buf) return;
+    if(delaySec > 0 && !st.running) return;                          // 等 resume 期间已被暂停 → 不再排
     master.gain.value = cfg.volume;
     const s = audioCtx.createBufferSource(); s.buffer = buf; s.connect(master);
-    s.start(audioCtx.currentTime + (delaySec > 0 ? delaySec : 0));   // 由音频线程精确排期,不靠主线程 tick
+    const at = audioCtx.currentTime + (delaySec > 0 ? delaySec : 0);
+    s.start(at);                                                     // 由音频线程精确排期,不靠主线程 tick
+    if(delaySec > 0) armed.push({ s, at });
     audioTouchedAt = Date.now();                                     // 真正发过声 → 刷新「引擎活着」时刻
   };
   if(audioCtx.state === "running"){ doPlay(); }
   else { (audioCtx.resume() || Promise.resolve()).then(doPlay).catch(()=>{}); }
 }
+function disarmSounds(){                       // 取消还没响的(正在响的那声不打断)
+  const now = audioCtx ? audioCtx.currentTime : 0;
+  armed.forEach(a => { if(a.at > now){ try{ a.s.stop(); }catch(e){} } });
+  armed = [];
+}
 function playCash(){ playBuf(cashBuf); }
 function playBell(){ playBuf(bellBuf); }
-function playPair(){
-  playBuf(cashBuf, 0);              // 闭眼:立即
-  playBuf(cashBuf, cfg.eyeSec);     // 睁眼:音频线程精确 eyeSec 秒后,不受后台标签页节流影响
+function playPair(delaySec){
+  playBuf(cashBuf, delaySec);                 // 闭眼
+  playBuf(cashBuf, delaySec + cfg.eyeSec);    // 睁眼:音频线程精确 eyeSec 秒后,不受后台标签页节流影响
 }
 
 /* ---------------- state ---------------- */
 let st = freshState();
 let ticker = null;
 let autoPaused = false;
+let lastMono = 0;                     // 上次 tick 的 performance.now(),配合 st.lastTick 判断是否真睡过
 
 function freshState(){
   const s = {
     phase:"focus", running:false, begun:false,
     totalMs: cfg.focusMin*60000, remainingMs: cfg.focusMin*60000,
-    nextRingAt:null, ringStage:"first", lastTick:0,
+    rings:[], lastTick:0,
   };
-  scheduleNextPair(s, 0);
+  s.rings = planRings(s.totalMs, 0);
   return s;
 }
 function randIntervalMs(){
   const lo = Math.min(cfg.minInterval, cfg.maxInterval), hi = Math.max(cfg.minInterval, cfg.maxInterval);
   return (lo + Math.random()*(hi-lo)) * 60000;
 }
-// 从 fromElapsed 起安排下一组的第一响;整组(含两响间隔)须落在专注结束前
-function scheduleNextPair(s, fromElapsed){
-  const t = fromElapsed + randIntervalMs();
-  if(t + cfg.eyeSec*1000 <= s.totalMs){ s.nextRingAt = t; s.ringStage = "first"; }
-  else { s.nextRingAt = null; }
+// 一次排好本轮专注每组第一响的时刻(距本轮开始 ms):每组从上一组睁眼起算随机间隔,整组须落在专注结束前
+function planRings(totalMs, fromElapsed){
+  const rings = [];
+  for(let t = fromElapsed + randIntervalMs(); t + cfg.eyeSec*1000 <= totalMs; t += cfg.eyeSec*1000 + randIntervalMs()) rings.push(t);
+  return rings;
+}
+
+/* ---------------- 提前排声音 ---------------- */
+// 本阶段接下来要响的声音一次性排进音频时钟:后台主线程被拖住几分钟,也照样准时响
+function armPhase(){
+  if(st.phase === "break"){ if(st.remainingMs >= 0 && !isLastRound()) playBuf(cashBuf, st.remainingMs/1000); return; }   // 大休息结束:点钞
+  if(st.phase !== "focus") return;
+  const elapsed = st.totalMs - st.remainingMs;
+  const left = st.remainingMs/1000, restEnd = left + Math.max(0, cfg.bigRestMin)*60;   // 已过去的时刻不补(被拖住很久时不一下子补响一串)
+  st.rings.forEach(t => { if(t >= elapsed) playPair((t - elapsed)/1000); });
+  if(left >= 0) playBuf(bellBuf, left);                              // 专注结束:钟声
+  if(restEnd >= 0 && !isLastRound()) playBuf(cashBuf, restEnd);      // 大休息结束 → 下一轮开始:点钞
 }
 
 /* ---------------- timing loop ---------------- */
 function tick(){
   if(!st.running) return;
-  const now = Date.now(), delta = now - st.lastTick;
-  st.lastTick = now;
-  if(delta > INACTIVITY_MS){ pause(true); return; }   // 睡眠/切走 → 自动暂停,不吞时间
+  const now = Date.now(), mono = performance.now(), delta = now - st.lastTick;
+  const slept = delta - (mono - lastMono);            // macOS 上 performance.now 睡眠时不走、Date 照走 → 差值=睡了多久
+  st.lastTick = now; lastMono = mono;
+  if(slept >= SLEEP_PAUSE_MS){ pause(true); return; } // 合盖睡眠 → 自动暂停,不吞时间;后台被节流(两个钟一起走)照常计时
 
   st.remainingMs -= delta;
 
   if(st.phase === "focus"){
-    if(st.remainingMs <= 0){
-      enterBreak();
-    }else{
-      const elapsed = st.totalMs - st.remainingMs;
-      // 响铃只叠加事件:不停表、不换字
-      while(st.nextRingAt != null && elapsed >= st.nextRingAt && st.remainingMs > 0){
-        playPair();                                    // 一组两响(闭眼 + eyeSec 秒后睁眼),间隔由音频时钟保证
-        scheduleNextPair(st, st.nextRingAt + cfg.eyeSec*1000);   // 从本组睁眼时刻起算下一组随机间隔
-      }
-    }
+    if(st.remainingMs <= 0) enterBreak();             // 每组响铃已在本轮开始时排进音频时钟,这里只管走表
   }else if(st.phase === "break"){
     if(st.remainingMs <= 0) endBreak();
   }
@@ -325,21 +339,23 @@ function tick(){
 }
 
 /* ---------------- phase transitions ---------------- */
-function enterBreak(){
-  playBell();                                          // 40分钟结束:钟声一次
+// tick 晚到(后台被拖住)时多走的时间算进下一阶段,倒计时才跟已排好的声音对得上
+function enterBreak(){                                 // 结束钟声已在本轮开始时排进音频时钟(armPhase)
   if(cfg.bigRestMin <= 0){ endBreak(); return; }
-  st.phase = "break"; st.totalMs = cfg.bigRestMin*60000; st.remainingMs = st.totalMs; st.nextRingAt = null;
+  const over = Math.max(0, -st.remainingMs);
+  st.phase = "break"; st.totalMs = cfg.bigRestMin*60000; st.remainingMs = st.totalMs - over;
   applyAccent(); saveSession();
 }
+function isLastRound(){ return cfg.rounds !== 0 && (st._round||1) >= cfg.rounds; }
 function endBreak(){
-  if(cfg.rounds !== 0 && (st._round||1) >= cfg.rounds){
+  if(isLastRound()){
     st.phase = "done"; st.running = false; stopTicker(); applyAccent(); render(); saveSession(); return;
   }
+  const over = Math.max(0, -st.remainingMs);
   st._round = (st._round||1) + 1;
-  st.phase = "focus"; st.totalMs = cfg.focusMin*60000; st.remainingMs = st.totalMs;
-  scheduleNextPair(st, 0); applyAccent();
-  playCash();                                          // 大休息结束 → 自动开始下一轮:点钞
-  saveSession();
+  st.phase = "focus"; st.totalMs = cfg.focusMin*60000; st.remainingMs = st.totalMs - over;
+  st.rings = planRings(st.totalMs, 0); applyAccent();
+  armPhase(); saveSession();                           // 开头的点钞已在上一轮开始时排好;这里排新一轮的
 }
 
 /* ---------------- controls ---------------- */
@@ -357,12 +373,12 @@ function start(){
   if(st.phase === "done") st = freshState();
   if(!st.begun){ st.begun = true; st._round = 1; }
   playCash();                                          // 首次开始 & 每次恢复都点钞(证明引擎活着/已继续)
-  st.running = true; autoPaused = false; st.lastTick = now;
-  startTicker(); render(); saveSession();
+  st.running = true; autoPaused = false; st.lastTick = now; lastMono = performance.now();
+  armPhase(); startTicker(); render(); saveSession();
 }
-function pause(auto){ st.running = false; autoPaused = !!auto; stopTicker(); render(); saveSession(); }
+function pause(auto){ st.running = false; autoPaused = !!auto; stopTicker(); disarmSounds(); render(); saveSession(); }
 function toggle(){ st.running ? pause(false) : start(); }
-function reset(){ st.running = false; autoPaused = false; stopTicker(); st = freshState(); applyAccent(); render(); saveSession(); }
+function reset(){ st.running = false; autoPaused = false; stopTicker(); disarmSounds(); st = freshState(); applyAccent(); render(); saveSession(); }
 function startTicker(){ if(!ticker) ticker = setInterval(tick, 250); }
 function stopTicker(){ if(ticker){ clearInterval(ticker); ticker = null; } }
 
@@ -411,6 +427,7 @@ function readSettings(){
   saveCfg();
   if(master) master.gain.value=cfg.volume;
   if(!st.running){ st=freshState(); applyAccent(); }
+  else { disarmSounds(); armPhase(); }                 // 计时中改设置:按新设置重排还没响的声音
   render();
 }
 
@@ -443,6 +460,7 @@ document.addEventListener("keydown", e => {
 initAudio();          // 提前建好(挂起)音频上下文并解码,首次点击即可发声
 const _saved = loadSession();
 if(_saved){ st = _saved.st; autoPaused = !!_saved.autoPaused; st.running = false; }  // 还原上次进度为「暂停」态(刷新后不丢 26/40)
+if(!Array.isArray(st.rings)) st.rings = planRings(st.totalMs, st.totalMs - st.remainingMs);   // 旧版存档没有 rings:从当前进度往后重新排
 applyAccent();
 render();
 </script>

@@ -10,15 +10,18 @@ async function openApp(page){
   await page.goto(APP_URL);
 }
 
-// 系统音频边界的假件:不真正发声,只记下「哪种声音排在音频时钟第几秒」,以及有没有在响之前被取消
+// 系统音频边界的假件:不真正发声,只记下「哪种声音排在音频时钟第几秒」、有没有在响之前被取消,
+// 以及页面什么时候看不见、什么时候一直在往外出声 —— 用来按 Safari 的规矩算页面会不会被冻结
 async function recordSounds(page){
   await page.addInitScript(() => {
-    window.__sounds = [];
+    window.__sounds = []; window.__outputs = []; window.__visibility = [];
+    document.addEventListener("visibilitychange", () =>
+      window.__visibility.push({ t: performance.now() / 1000, hidden: document.visibilityState === "hidden" }));
     class FakeAudioContext {
-      constructor(){ this.state = "suspended"; this.destination = {}; }
+      constructor(){ this.state = "suspended"; this.destination = {}; this.bornAt = this.currentTime; }
       get currentTime(){ return performance.now() / 1000; }            // 各引擎共用一条音频时钟,重建前后的时刻可比
       resume(){ this.state = "running"; return Promise.resolve(); }
-      close(){ this.state = "closed"; return Promise.resolve(); }
+      close(){ this.state = "closed"; this.closedAt = this.currentTime; return Promise.resolve(); }
       createGain(){ return { gain: { value: 1 }, connect(){} }; }
       decodeAudioData(data, ok){
         const buf = { kind: data.byteLength > 25000 ? "bell" : "cash" };   // 内嵌录音:点钞 21.7KB,钟声 32KB
@@ -27,20 +30,46 @@ async function recordSounds(page){
       createBufferSource(){
         const ctx = this;
         return { buffer: null, connect(){},
-          start(when){ this._rec = { kind: this.buffer.kind, at: when }; window.__sounds.push(this._rec); },
+          start(when){ this._rec = { kind: this.buffer.kind, at: when, bornAt: ctx.bornAt }; window.__sounds.push(this._rec); },
           stop(){ if(this._rec) this._rec.stoppedAt = ctx.currentTime; } };
+      }
+      createConstantSource(){                                           // 一直输出同一个数:不是 0 就算「在出声」
+        const ctx = this;
+        return { offset: { value: 1 }, connect(){},
+          start(){ this._rec = { ctx, node: this, from: ctx.currentTime }; window.__outputs.push(this._rec); },
+          stop(){ if(this._rec) this._rec.to = ctx.currentTime; } };
       }
     }
     window.AudioContext = window.webkitAudioContext = FakeAudioContext;
   });
 }
 
-// 到目前为止用户实际听到的声音:时刻已到、且没在响之前被取消;时刻换算成「距点开始那一声几秒」
+// Safari 的规矩(2026-10-28 本机系统日志):窗口一看不见、页面又没在出声,几秒内整个网页进程就被冻结
+// (出声时挂的保活,声音停后约 10 秒放掉);冻结时什么都不跑,恢复后原来那个音频引擎看着在跑、其实再也出不了声
+const FREEZE_AFTER_SEC = 10, SOUND_SEC = 2;
+function freezeTimes({ sounds, outputs, visibility, now }){
+  const hiddenAt = t => visibility.reduce((hidden, v) => v.t <= t ? v.hidden : hidden, false);
+  const outputting = t => sounds.some(s => s.at <= t && t < s.at + SOUND_SEC && !(s.stoppedAt <= s.at))
+                       || outputs.some(o => o.level !== 0 && o.from <= t && !(o.to <= t));
+  const freezes = [];
+  for(let t = 0, quiet = 0, frozen = false; t <= now; t++){
+    if(!hiddenAt(t)){ quiet = 0; frozen = false; continue; }
+    if(frozen) continue;
+    quiet = outputting(t) ? 0 : quiet + 1;
+    if(quiet >= FREEZE_AFTER_SEC){ freezes.push(t); frozen = true; }
+  }
+  return freezes;
+}
+
+// 到目前为止用户实际听到的声音:时刻已到、没在响之前被取消、引擎也没被冻结弄哑;时刻换算成「距点开始那一声几秒」
 async function heardSounds(page){
-  const { all, now } = await page.evaluate(() => ({ all: window.__sounds, now: performance.now() / 1000 }));
-  const t0 = all[0].at;
-  return all.filter(s => s.at <= now && (s.stoppedAt === undefined || s.stoppedAt > s.at))
-            .map(s => [s.kind, Math.round(s.at - t0)]);
+  const rec = await page.evaluate(() => ({
+    sounds: window.__sounds, visibility: window.__visibility, now: performance.now() / 1000,
+    outputs: window.__outputs.map(o => ({ from: o.from, to: o.to ?? o.ctx.closedAt, level: o.node.offset.value })) }));
+  const freezes = freezeTimes(rec), t0 = rec.sounds[0].at;
+  return rec.sounds.filter(s => s.at <= rec.now && (s.stoppedAt === undefined || s.stoppedAt > s.at)
+                             && !freezes.some(f => s.bornAt < f && f <= s.at))   // 冻结前就在的引擎,冻结之后排到的声音全哑
+                   .map(s => [s.kind, Math.round(s.at - t0)]);
 }
 
 // 跟用户一样从设置面板改参数(专注时长调短,让模拟跑得快)
@@ -58,6 +87,22 @@ async function sleepMac(page, ms){
   const now = await page.evaluate(() => Date.now());
   await page.clock.setSystemTime(now + ms);
 }
+
+// 页面此刻是不是还在一直往外出声(保活)
+async function keepingAudioOn(page){
+  return page.evaluate(() => window.__outputs.some(o => o.node.offset.value !== 0 && o.to === undefined && o.ctx.closedAt === undefined));
+}
+
+// 窗口被别的窗口盖住 / 切到别的桌面(Safari 把页面标成「看不见」),或者切回来
+async function setWindowVisible(page, visible){
+  await page.evaluate(visible => {
+    Object.defineProperty(document, "visibilityState", { value: visible ? "visible" : "hidden", configurable: true });
+    Object.defineProperty(document, "hidden", { value: !visible, configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }, visible);
+}
+const hideWindow = page => setWindowVisible(page, false);
+const showWindow = page => setWindowVisible(page, true);
 
 test("后台计时被拖住 150 秒,表继续走,Break 按时到来", async ({ page }) => {
   await openApp(page);
@@ -200,4 +245,69 @@ test("计时中把大休息改长,休息结束的点钞跟着新时长走", asyn
 
   const cash = (await heardSounds(page)).filter(([kind]) => kind === "cash");
   expect(cash).toEqual([["cash", 0], ["cash", 420]]);  // 5:00 专注 + 2:00 休息
+});
+
+test("窗口一直藏着(Safari 会冻结看不见又不出声的网页),一整轮提示音和结束钟声照样全响", async ({ page }) => {
+  await recordSounds(page);
+  await openApp(page);
+  await configure(page, { minInterval: 3, maxInterval: 3, focusMin: 15, eyeSec: 7 });
+  await page.click("#playBtn");
+  await hideWindow(page);                             // 切到别的桌面去学习
+  await page.clock.runFor("15:01");
+
+  expect(await heardSounds(page)).toEqual([
+    ["cash", 0],                                      // 点开始
+    ["cash", 180], ["cash", 187], ["cash", 367], ["cash", 374],
+    ["cash", 554], ["cash", 561], ["cash", 741], ["cash", 748],
+    ["bell", 900],                                    // 专注结束
+  ]);
+});
+
+test("暂停后、全部轮次结束后,不再一直输出保活信号(不计时就让 Safari 照常冻结页面,不白耗电)", async ({ page }) => {
+  await recordSounds(page);
+  await openApp(page);
+  await configure(page, { minInterval: 10, maxInterval: 10, focusMin: 5, bigRestMin: 1, rounds: 1 });
+  await page.click("#playBtn");
+  await page.clock.runFor("00:10");
+  await page.click("#playBtn");                       // 暂停
+  expect(await keepingAudioOn(page)).toBe(false);
+
+  await page.click("#playBtn");                       // 继续,跑完唯一一轮:专注 5 分 + 休息 1 分
+  await page.clock.runFor("06:00");
+  await expect(page.locator("#phase")).toHaveText("Done");
+  expect(await keepingAudioOn(page)).toBe(false);
+});
+
+test("暂停后窗口藏过、不到 2 分钟就回来点继续,点钞和之后的提示音照样响", async ({ page }) => {
+  await recordSounds(page);
+  await openApp(page);
+  await configure(page, { minInterval: 1, maxInterval: 1, focusMin: 30, eyeSec: 7 });
+  await page.click("#playBtn");
+  await page.clock.runFor("00:10");
+  await page.click("#playBtn");                       // 暂停
+  await hideWindow(page);                             // 切走:不计时、不出声 → Safari 冻结网页
+  await page.clock.runFor("00:30");
+  await showWindow(page);
+  await page.click("#playBtn");                       // 第 40 秒继续,空闲还不到 2 分钟
+  await page.clock.runFor("01:00");
+
+  expect(await heardSounds(page)).toEqual([
+    ["cash", 0], ["cash", 40],                        // 开始、继续
+    ["cash", 90], ["cash", 97],                       // 专注第 1:00 那组(暂停的 30 秒不算)
+  ]);
+});
+
+test("暂停后窗口藏过,回来在设置里试听点钞,照样能听到", async ({ page }) => {
+  await recordSounds(page);
+  await openApp(page);
+  await page.click("#playBtn");
+  await page.clock.runFor("00:10");
+  await page.click("#playBtn");                       // 暂停
+  await hideWindow(page);
+  await page.clock.runFor("00:30");
+  await showWindow(page);
+  await page.click("#gear");
+  await page.click("#testCash");                      // 第 40 秒试听
+
+  expect(await heardSounds(page)).toEqual([["cash", 0], ["cash", 40]]);
 });

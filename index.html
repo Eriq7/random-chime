@@ -226,9 +226,11 @@ const el = { phase:$("phase"), time:$("time"), ring:$("ringFg"), status:$("statu
 const RING_C = 2 * Math.PI * 110;
 el.ring.style.strokeDasharray = RING_C;
 
-/* ---------------- audio (只在响的一瞬发声,平时完全静音) ---------------- */
+/* ---------------- audio (只在响的一瞬发声;计时中另有一路听不见的保活信号) ---------------- */
 let audioCtx=null, master=null, cashBuf=null, bellBuf=null;
 let armed = [];                               // 提前排进音频时钟、还没响的声音 {s, at};暂停/重置时取消
+let keepAlive = null;                         // 计时中一直输出的极小信号:Safari 会冻结「看不见又没在出声」的网页,冻结后排好的声音全哑
+let mayBeFrozen = false;                      // 不计时时窗口藏过 → 网页可能被冻过,旧引擎恢复后多半是哑的;下次点开始/试听换新的
 let audioTouchedAt = 0;                       // 最近一次「引擎确实活着」的时刻(建 ctx 或成功发声);用于判断是否需换新引擎
 const REBUILD_IDLE_MS = 120000;              // 空闲≥2分钟再点开始 → 先重建全新音频引擎(旧引擎可能已被系统拆掉,且 state 会撒谎报 running)
 function b64ToArrayBuffer(b64){
@@ -240,7 +242,7 @@ function buildAudio(){                        // 造一个全新引擎(在用户
   const AC = window.AudioContext || window.webkitAudioContext;
   audioCtx = new AC();
   master = audioCtx.createGain(); master.gain.value = cfg.volume; master.connect(audioCtx.destination);
-  audioTouchedAt = Date.now();
+  audioTouchedAt = Date.now(); mayBeFrozen = false;
   // 挂起状态即可解码,提前备好缓冲,首次点击就能立刻响
   audioCtx.decodeAudioData(b64ToArrayBuffer(CASH_B64), b=>{ cashBuf=b; }, ()=>{});
   audioCtx.decodeAudioData(b64ToArrayBuffer(BELL_B64), b=>{ bellBuf=b; }, ()=>{});
@@ -253,6 +255,10 @@ function rebuildAudio(){                       // 换新引擎:先 close 旧的(
   buildAudio();
   // 旧的已解码 cashBuf/bellBuf 仍保留引用,AudioBuffer 可跨 context 使用 → 新引擎当场就能响;
   // buildAudio 里新引擎重新解码回来后会自动替换,供后续响铃用。
+}
+function ensureLiveAudio(){                    // 点开始/试听时(手势内)调用:旧引擎可能已哑就换新的;计时中不换,免得丢掉排好的声音
+  if(st.running) return;
+  if(!audioCtx || mayBeFrozen || Date.now() - audioTouchedAt >= REBUILD_IDLE_MS) rebuildAudio();
 }
 function unlockAudio(){ initAudio(); if(audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); } }
 function playBuf(buf, delaySec){
@@ -270,11 +276,23 @@ function playBuf(buf, delaySec){
   if(audioCtx.state === "running"){ doPlay(); }
   else { (audioCtx.resume() || Promise.resolve()).then(doPlay).catch(()=>{}); }
 }
-function disarmSounds(){                       // 取消还没响的(正在响的那声不打断)
+function disarmSounds(){                       // 取消还没响的(正在响的那声不打断),并停掉保活
   const now = audioCtx ? audioCtx.currentTime : 0;
   armed.forEach(a => { if(a.at > now){ try{ a.s.stop(); }catch(e){} } });
   armed = [];
+  stopKeepAlive();
 }
+function startKeepAlive(){                     // -80 dB 的直流,人耳听不见;但不是 0,WebKit 就认定页面在出声、不冻结它
+  if(keepAlive || !audioCtx) return;
+  try{
+    keepAlive = audioCtx.createConstantSource();
+    keepAlive.offset.value = 1e-4;
+    keepAlive.connect(audioCtx.destination);   // 不经过音量(master):音量调到 0 也照样保活
+    keepAlive.start();
+  }catch(e){ keepAlive = null; }
+}
+function stopKeepAlive(){ if(keepAlive){ try{ keepAlive.stop(); }catch(e){} keepAlive = null; } noteHidden(); }
+function noteHidden(){ if(document.hidden && !keepAlive) mayBeFrozen = true; }   // 看不见又没保活 → Safari 几秒内就会冻结网页
 function playCash(){ playBuf(cashBuf); }
 function playBell(){ playBuf(bellBuf); }
 function playPair(delaySec){
@@ -311,6 +329,7 @@ function planRings(totalMs, fromElapsed){
 /* ---------------- 提前排声音 ---------------- */
 // 本阶段接下来要响的声音一次性排进音频时钟:后台主线程被拖住几分钟,也照样准时响
 function armPhase(){
+  startKeepAlive();                                                  // 有声音排着就一直保持出声,窗口藏起来也不会被 Safari 冻结
   if(st.phase === "break"){ if(st.remainingMs >= 0 && !isLastRound()) playBuf(cashBuf, st.remainingMs/1000); return; }   // 大休息结束:点钞
   if(st.phase !== "focus") return;
   const elapsed = st.totalMs - st.remainingMs;
@@ -349,7 +368,7 @@ function enterBreak(){                                 // 结束钟声已在本�
 function isLastRound(){ return cfg.rounds !== 0 && (st._round||1) >= cfg.rounds; }
 function endBreak(){
   if(isLastRound()){
-    st.phase = "done"; st.running = false; stopTicker(); applyAccent(); render(); saveSession(); return;
+    st.phase = "done"; st.running = false; stopTicker(); disarmSounds(); applyAccent(); render(); saveSession(); return;
   }
   const over = Math.max(0, -st.remainingMs);
   st._round = (st._round||1) + 1;
@@ -361,7 +380,7 @@ function endBreak(){
 /* ---------------- controls ---------------- */
 function start(){
   const now = Date.now();
-  if(!audioCtx || now - audioTouchedAt >= REBUILD_IDLE_MS) rebuildAudio();  // 空闲≥2分钟:在点击手势内直接换新引擎 → 一定能出声(不信任 state、不依赖 visibility)
+  ensureLiveAudio();                                    // 可能被冻过 / 空闲≥2分钟:在点击手势内直接换新引擎 → 一定能出声(不信任 state)
   unlockAudio();                                        // 新 ctx / 短暂空闲的旧 ctx 在此 resume
   if(audioCtx && audioCtx.state !== "running"){         // 最终兜底:连新引擎都唤不醒 = 真·设备死 → 整页刷新(进度已存,再点一次即出声)
     setTimeout(() => {
@@ -438,12 +457,12 @@ el.gear.addEventListener("click", openSettings);
 el.overlay.addEventListener("click", e => { if(e.target === el.overlay) closeSettings(); });
 $("closeSettings").addEventListener("click", closeSettings);
 $("saveSettings").addEventListener("click", () => { readSettings(); closeSettings(); });
-$("testCash").addEventListener("click", () => { unlockAudio(); if(master) master.gain.value = parseFloat(sEl.volume.value); playCash(); });
-$("testBell").addEventListener("click", () => { unlockAudio(); if(master) master.gain.value = parseFloat(sEl.volume.value); playBell(); });
+$("testCash").addEventListener("click", () => { ensureLiveAudio(); unlockAudio(); if(master) master.gain.value = parseFloat(sEl.volume.value); playCash(); });
+$("testBell").addEventListener("click", () => { ensureLiveAudio(); unlockAudio(); if(master) master.gain.value = parseFloat(sEl.volume.value); playBell(); });
 $("volume").addEventListener("input", () => { if(master) master.gain.value = parseFloat(sEl.volume.value); });
 
 document.addEventListener("visibilitychange", () => {
-  if(document.visibilityState === "hidden"){ saveSession(); return; }                          // 进入后台:存档(长空闲后的换新引擎改由「点开始时重建」负责)
+  if(document.visibilityState === "hidden"){ noteHidden(); saveSession(); return; }            // 进入后台:存档;不在计时就记下「可能被冻」
   if(audioCtx && audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); }  // 回前台:短暂离开 resume 常能救活
   if(st.running) tick();
 });
@@ -458,6 +477,7 @@ document.addEventListener("keydown", e => {
 
 /* ---------------- init ---------------- */
 initAudio();          // 提前建好(挂起)音频上下文并解码,首次点击即可发声
+noteHidden();         // 一打开就在后台(看不见):可能马上被冻,点开始时换新引擎
 const _saved = loadSession();
 if(_saved){ st = _saved.st; autoPaused = !!_saved.autoPaused; st.running = false; }  // 还原上次进度为「暂停」态(刷新后不丢 26/40)
 if(!Array.isArray(st.rings)) st.rings = planRings(st.totalMs, st.totalMs - st.remainingMs);   // 旧版存档没有 rings:从当前进度往后重新排

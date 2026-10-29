@@ -292,7 +292,7 @@ function startKeepAlive(){                     // -80 dB 的直流,人耳听不�
   }catch(e){ keepAlive = null; }
 }
 function stopKeepAlive(){ if(keepAlive){ try{ keepAlive.stop(); }catch(e){} keepAlive = null; } noteHidden(); }
-function noteHidden(){ if(document.hidden && !keepAlive) mayBeFrozen = true; }   // 看不见又没保活 → Safari 几秒内就会冻结网页
+function noteHidden(){ if(document.hidden && !keepAlive) mayBeFrozen = true; }   // 看不见又没保活 → 连续藏满 8 分钟 Safari 就冻结网页;保守起见藏过就算
 function playCash(){ playBuf(cashBuf); }
 function playBell(){ playBuf(bellBuf); }
 function playPair(delaySec){

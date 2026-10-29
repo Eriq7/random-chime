@@ -44,8 +44,9 @@ async function recordSounds(page){
   });
 }
 
-// Safari 的规矩(2026-10-28 本机系统日志):窗口一看不见、页面又没在出声,几秒内整个网页进程就被冻结
-// (出声时挂的保活,声音停后约 10 秒放掉);冻结时什么都不跑,恢复后原来那个音频引擎看着在跑、其实再也出不了声
+// Safari 的规矩(2026-10-28/29 本机系统日志):窗口连续看不见满 8 分钟、页面又已经静了 10 秒,整个网页进程就被冻结;
+// 冻结时什么都不跑,恢复后原来那个音频引擎看着在跑、其实再也出不了声。
+// 这里故意用更严的「看不见 + 静了 10 秒就冻」:冻得只会比真机早、比真机多,在这里能响,真机上一定能响
 const FREEZE_AFTER_SEC = 10, SOUND_SEC = 2;
 function freezeTimes({ sounds, outputs, visibility, now }){
   const hiddenAt = t => visibility.reduce((hidden, v) => v.t <= t ? v.hidden : hidden, false);

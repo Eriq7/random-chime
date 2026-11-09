@@ -113,18 +113,22 @@
   .overlay.stats{ z-index:21; }
   .panel.stats-panel{ width:min(100%, 830px); }
   .stats-summary{ font-size:14px; color:var(--text); margin-bottom:14px; }
-  .heat-scroll{ overflow-x:auto; padding-bottom:6px; }
-  .heat{ width:max-content; --cell:11px; --gap:3px; }
-  .heat-months{ position:relative; height:16px; margin-left:26px; font-size:11px; color:var(--muted); }
+  /* 星期标签固定在左边不跟着滚;右边滚动区用 rtl,打开时天然停在最右(今天 + 未来),不靠 JS 算滚动位置 */
+  .heat-wrap{ display:flex; gap:6px; --cell:11px; --gap:3px; }
+  .heat-scroll{ flex:1; min-width:0; overflow-x:auto; padding-bottom:6px; direction:rtl; }
+  .heat{ width:max-content; direction:ltr; }
+  .heat-months{ position:relative; height:16px; font-size:11px; color:var(--muted); }
   .heat-months span{ position:absolute; top:0; white-space:nowrap; }
-  .heat-body{ display:flex; gap:6px; }
-  .heat-days{ display:grid; grid-template-rows:repeat(7, var(--cell)); gap:var(--gap); width:20px; font-size:10px; line-height:var(--cell); color:var(--muted); }
+  .heat-days{ flex:none; margin-top:16px; display:grid; grid-template-rows:repeat(7, var(--cell)); gap:var(--gap); width:20px; font-size:10px; line-height:var(--cell); color:var(--muted); }
+  .heat-under{ position:relative; height:16px; }
+  .heat-today{ position:absolute; top:4px; transform:translateX(-50%); font-size:10px; line-height:1; color:var(--text); white-space:nowrap; }
   .heat-grid{ display:grid; grid-auto-flow:column; grid-template-rows:repeat(7, var(--cell)); grid-auto-columns:var(--cell); gap:var(--gap); }
   .cell{ display:block; width:var(--cell); height:var(--cell); border-radius:2px; outline:1px solid #ffffff0d; outline-offset:-1px; background:var(--heat-0); }
-  .cell.none{ background:none; outline:none; }
+  .cell.future{ background:none; outline:1px dashed #ffffff1a; }
+  .cell.today{ outline:1.5px solid var(--text); outline-offset:1px; }
   .cell.l1{ background:var(--heat-1); } .cell.l2{ background:var(--heat-2); }
   .cell.l3{ background:var(--heat-3); } .cell.l4{ background:var(--heat-4); }
-  .heat-grid .cell[data-date]:hover{ outline:1px solid var(--text); }
+  .heat-grid .cell[data-tip]:hover{ outline:1px solid var(--text); }
   .heat-legend{ display:flex; align-items:center; justify-content:flex-end; gap:4px; margin-top:10px; font-size:11px; color:var(--muted); --cell:11px; }
   .heat-legend .cell{ margin:0 1px; }
   .stats-note{ margin-top:12px; font-size:12px; color:var(--faint); line-height:1.6; }
@@ -245,12 +249,13 @@
     <div class="panel stats-panel" role="dialog" aria-label="学习记录">
       <h2>学习记录</h2>
       <div class="stats-summary" id="statsSummary"></div>
-      <div class="heat-scroll" id="heatScroll">
-        <div class="heat">
-          <div class="heat-months" id="heatMonths"></div>
-          <div class="heat-body">
-            <div class="heat-days"><span></span><span>一</span><span></span><span>三</span><span></span><span>五</span><span></span></div>
+      <div class="heat-wrap">
+        <div class="heat-days"><span></span><span>一</span><span></span><span>三</span><span></span><span>五</span><span></span></div>
+        <div class="heat-scroll" id="heatScroll">
+          <div class="heat">
+            <div class="heat-months" id="heatMonths"></div>
             <div class="heat-grid" id="heatGrid"></div>
+            <div class="heat-under"><span class="heat-today" id="heatToday">今天</span></div>
           </div>
         </div>
       </div>
@@ -666,32 +671,41 @@ function readSettings(){
 }
 
 /* ---------------- study heatmap ui ---------------- */
-const WEEKS = 53, CELL_PITCH = 14;                     // 一整年 53 列;格子 11px + 间隔 3px
+const WEEKS = 53, CELL_PITCH = 14, CELL_GAP = 3;      // 过去一整年 53 列(最后一列含今天);格子 11px + 间隔 3px
 function fmtMin(m){ const t = Math.round(m); return t < 60 ? t + " 分钟" : Math.floor(t/60) + " 小时" + (t%60 ? " " + t%60 + " 分钟" : ""); }
 function levelOf(min){ return LEVEL_MIN.reduce((l, t, i) => min >= t ? i + 1 : l, 0); }
+// 可见宽度能放几列,右边 1/5 画未来:打开(停在最右)时左 4/5 是过去,今天那一列卡在 4/5 处(Eric 定的比例)
+function futureWeeks(){
+  const cols = Math.floor(($("heatScroll").clientWidth + CELL_GAP) / CELL_PITCH);
+  return Math.max(1, Math.round(cols / 5));
+}
+let heatFuture = 0;
 function renderHeatmap(){
   const today = new Date(), todayKey = dayKey(today);
   const y = today.getFullYear(), m = today.getMonth(), d0 = today.getDate() - today.getDay() - (WEEKS-1)*7;   // 53 周前那个周日
+  heatFuture = futureWeeks();
+  const cols = WEEKS + heatFuture;
   let cells = "", labels = [], prevMonth = -1, sumN = 0, sumMin = 0;
-  for(let w = 0; w < WEEKS; w++){
+  for(let w = 0; w < cols; w++){
     const mon = new Date(y, m, d0 + w*7).getMonth();
     if(mon !== prevMonth) labels.push({ w, text: (mon+1) + "月" });
     prevMonth = mon;
     for(let i = 0; i < 7; i++){
       const day = new Date(y, m, d0 + w*7 + i), k = dayKey(day);
-      if(k > todayKey){ cells += '<i class="cell none"></i>'; continue; }          // 今天之后的格子不画
-      const rec = studyLog[k], n = rec ? rec.n : 0, min = rec ? rec.min : 0, lv = levelOf(min);
+      if(k > todayKey){ cells += '<i class="cell future" data-date="' + k + '" data-future="1"></i>'; continue; }   // 未来:空格子,不算数、没提示
+      const rec = studyLog[k], n = rec ? rec.n : 0, min = rec ? rec.min : 0, lv = levelOf(min), isToday = k === todayKey;
       sumN += n; sumMin += min;
-      const tip = (day.getMonth()+1) + "月" + day.getDate() + "日 · " + (n ? "完成 " + n + " 次专注 · " + fmtMin(min) : "没有完成专注");
-      cells += '<i class="cell l' + lv + '" data-date="' + k + '" data-level="' + lv + '" data-minutes="' + min + '" data-tip="' + tip + '"></i>';
+      const tip = (isToday ? "今天 · " : "") + (day.getMonth()+1) + "月" + day.getDate() + "日 · " + (n ? "完成 " + n + " 次专注 · " + fmtMin(min) : "没有完成专注");
+      cells += '<i class="cell l' + lv + (isToday ? ' today" aria-current="date' : '') + '" data-date="' + k + '" data-level="' + lv + '" data-minutes="' + min + '" data-tip="' + tip + '"></i>';
     }
   }
-  labels = labels.filter((l, i) => i === labels.length-1 || labels[i+1].w - l.w >= 3);   // 太挤的月份标签丢掉(第一个不完整的月份)
+  labels = labels.filter((l, i) => (i === labels.length-1 || labels[i+1].w - l.w >= 3) && l.w <= cols - 2);   // 太挤的、贴着最右边会撑出空白的月份标签丢掉
   $("heatGrid").innerHTML = cells;
   $("heatMonths").innerHTML = labels.map(l => '<span style="left:' + l.w*CELL_PITCH + 'px">' + l.text + '</span>').join("");
+  $("heatToday").style.left = ((WEEKS-1)*CELL_PITCH + (CELL_PITCH-CELL_GAP)/2) + "px";
   $("statsSummary").textContent = "过去一年完成 " + sumN + " 次专注" + (sumN ? " · 共 " + fmtMin(sumMin) : "");
 }
-function openStats(){ requestSync(); renderHeatmap(); el.stats.classList.add("open"); $("heatScroll").scrollLeft = $("heatScroll").scrollWidth; }   // 窄屏默认滚到最近的一周
+function openStats(){ requestSync(); renderHeatmap(); el.stats.classList.add("open"); $("heatScroll").scrollLeft = 0; }   // rtl 滚动区里 0 = 最右边(今天 + 未来)
 function closeStats(){ el.stats.classList.remove("open"); hideTip(); }
 function showTip(cellEl){
   const tip = $("heatTip"), r = cellEl.getBoundingClientRect();
@@ -778,6 +792,7 @@ el.stats.addEventListener("click", e => { if(e.target === el.stats) closeStats()
 $("heatGrid").addEventListener("mouseover", e => { if(e.target.dataset && e.target.dataset.tip) showTip(e.target); });
 $("heatGrid").addEventListener("mouseout", hideTip);
 $("heatScroll").addEventListener("scroll", hideTip);
+new ResizeObserver(() => { if(el.stats.classList.contains("open") && futureWeeks() !== heatFuture) renderHeatmap(); }).observe($("heatScroll"));   // 窗口变大变小、横竖屏切换:重算未来几列,今天仍在 4/5
 $("saveSettings").addEventListener("click", () => { readSettings(); closeSettings(); });
 $("testCash").addEventListener("click", () => { ensureLiveAudio(); unlockAudio(); if(master) master.gain.value = parseFloat(sEl.volume.value); playCash(); });
 $("testBell").addEventListener("click", () => { ensureLiveAudio(); unlockAudio(); if(master) master.gain.value = parseFloat(sEl.volume.value); playBell(); });

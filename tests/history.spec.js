@@ -138,14 +138,58 @@ test("刷新页面后,学习记录还在", async ({ page }) => {
   await expect(cell(page, "2026-10-19")).toHaveAttribute("data-level", "1");
 });
 
-test("画法跟 GitHub 一样:一整年 53 周、最后一格是今天、没有未来的格子", async ({ page }) => {
+test("过去画一整年(53 周、周日起),今天之后画成空的未来格子:不算数、没有悬停提示", async ({ page }) => {
   await openApp(page);                                // 2026-10-19 是周一
   await openStats(page);
 
-  await expect(page.locator("#heatGrid [data-date]")).toHaveCount(366);   // 2025-10-19(周日)… 2026-10-19
+  await expect(page.locator("#heatGrid [data-level]")).toHaveCount(366);  // 2025-10-19(周日)… 2026-10-19
   await expect(cell(page, "2025-10-19")).toHaveCount(1);
   await expect(cell(page, "2025-10-18")).toHaveCount(0);
-  await expect(cell(page, "2026-10-20")).toHaveCount(0);
+  await expect(cell(page, "2026-10-20")).toHaveAttribute("data-future", "1");
+  await expect(cell(page, "2026-10-20")).not.toHaveAttribute("data-tip", /./);
+  await expect(cell(page, "2026-10-20")).not.toHaveAttribute("data-level", /./);
+});
+
+// 用户一打开就要看到今天:不管窗口多大、横屏竖屏,可见区域左边 4/5 是过去、右边 1/5 是未来,今天卡在分界线上,不用自己左右滑
+async function expectTodayAtFourFifths(page){
+  const today = cell(page, "2026-10-19");
+  await expect(today).toBeInViewport();
+  const view = await page.locator("#heatScroll").boundingBox(), box = await today.boundingBox();
+  const ratio = (box.x + box.width - view.x) / view.width;              // 今天那一列的右边缘落在可见宽度的哪里
+  expect(ratio).toBeGreaterThan(0.72);
+  expect(ratio).toBeLessThan(0.88);
+}
+for(const [w, h, name] of [[1280, 800, "宽窗口"], [700, 900, "窄窗口"], [390, 844, "手机竖屏"], [844, 390, "手机横屏"]]){
+  test(`${name}(${w}×${h}):打开学习记录,今天在可见区域约 4/5 处,右边是未来`, async ({ page }) => {
+    await page.setViewportSize({ width: w, height: h });
+    await openApp(page);
+    await openStats(page);
+
+    await expectTodayAtFourFifths(page);
+    await expect(cell(page, "2026-10-20")).toBeInViewport();             // 明天(未来)也看得见
+  });
+}
+
+test("学习记录开着时改窗口大小,今天仍在约 4/5 处", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await openApp(page);
+  await openStats(page);
+  await expectTodayAtFourFifths(page);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(async () => { try { await expectTodayAtFourFifths(page); return true; } catch { return false; } }).toBe(true);
+});
+
+test("今天那一格有「今天」标记,一眼能找到", async ({ page }) => {
+  await openApp(page);
+  await openStats(page);
+
+  const label = page.locator("#heatToday");
+  await expect(label).toHaveText("今天");
+  await expect(label).toBeInViewport();
+  const l = await label.boundingBox(), c = await cell(page, "2026-10-19").boundingBox();
+  expect(Math.abs((l.x + l.width/2) - (c.x + c.width/2))).toBeLessThan(4);   // 标记正对着今天那一列
+  await expect(cell(page, "2026-10-19")).toHaveAttribute("aria-current", "date");
 });
 
 test("学习记录开着时,按空格不会误触开始计时", async ({ page }) => {

@@ -48,6 +48,27 @@ test("登录状态下走满一次专注,云端收到 1 条(40 分钟、走完那
   expect(rows[0].clientId).toBeTruthy();
 });
 
+test("登录状态下学 20 分钟就暂停,云端收到 1 条 20 分钟", async ({ page }) => {
+  await openApp(page, { signedIn: true });
+  await page.click("#playBtn");
+  await elapse(page, "20:00");
+  await page.click("#playBtn");                       // 暂停
+
+  await expect.poll(() => cloudRows(page).then(r => r.length)).toBe(1);
+  expect((await cloudRows(page))[0].minutes).toBe(20);
+});
+
+test("点开始马上又暂停(2 秒):不产生记录,也不会卡在「待上传」(云端不收 0 分钟)", async ({ page }) => {
+  await openApp(page, { signedIn: true });
+  await page.click("#playBtn");
+  await page.clock.runFor("00:02");
+  await page.click("#playBtn");                       // 暂停
+  await page.click("#gear");
+
+  await expect(page.locator("#cloudState")).toContainText("已同步");
+  expect(await cloudRows(page)).toHaveLength(0);
+});
+
 test("没登录时走满的专注,之后登录就补传到云端", async ({ page }) => {
   await openApp(page);
   await finishOneFocus(page);

@@ -10,27 +10,38 @@ async function openApp(page){
   await page.goto(APP_URL);
 }
 
-// 系统音频边界的假件:不真正发声,只记下「哪种声音排在音频时钟第几秒」、有没有在响之前被取消,
-// 以及页面什么时候看不见、什么时候一直在往外出声 —— 用来按 Safari 的规矩算页面会不会被冻结
+// 系统音频边界的假件:不真正发声,只记下「哪种声音排在音频时钟第几秒、排在哪条输出上」、有没有在响之前被取消,
+// 每个引擎什么时候开着 / 关着,以及页面什么时候看不见、什么时候一直在往外出声 —— 用来按 Safari 的规矩算页面会不会被冻结、哪条输出被弄坏
 async function recordSounds(page){
   await page.addInitScript(() => {
-    window.__sounds = []; window.__outputs = []; window.__visibility = [];
+    window.__sounds = []; window.__outputs = []; window.__visibility = []; window.__contexts = [];
+    window.__suspendBroken = false;                                   // 测试开关:suspend() 一直不生效(模拟没料到的情况)
     document.addEventListener("visibilitychange", () =>
       window.__visibility.push({ t: performance.now() / 1000, hidden: document.visibilityState === "hidden" }));
     class FakeAudioContext {
-      constructor(){ this.state = "suspended"; this.destination = {}; this.bornAt = this.currentTime; }
+      constructor(opts){
+        this.sampleRate = (opts && opts.sampleRate) || 48000;           // 采样率不同 = 另一条系统输出(WebKit 按采样率共用输出)
+        this.destination = {}; this.bornAt = this.currentTime; this.states = [];
+        this._set("suspended"); window.__contexts.push(this);
+      }
+      _set(state){ this.state = state; this.states.push({ t: this.currentTime, state }); }
       get currentTime(){ return performance.now() / 1000; }            // 各引擎共用一条音频时钟,重建前后的时刻可比
-      resume(){ this.state = "running"; return Promise.resolve(); }
-      close(){ this.state = "closed"; this.closedAt = this.currentTime; return Promise.resolve(); }
+      resume(){ if(this.state !== "closed") this._set("running"); return Promise.resolve(); }
+      suspend(){
+        if(window.__suspendBroken) return new Promise(() => {});        // 一直不回来,输出一直开着
+        if(this.state !== "closed") this._set("suspended"); return Promise.resolve();
+      }
+      close(){ this._set("closed"); this.closedAt = this.currentTime; return Promise.resolve(); }
       createGain(){ return { gain: { value: 1 }, connect(){} }; }
       decodeAudioData(data, ok){
-        const buf = { kind: data.byteLength > 25000 ? "bell" : "cash" };   // 内嵌录音:点钞 21.7KB,钟声 32KB
+        const bell = data.byteLength > 25000;                           // 内嵌录音:点钞 21.7KB / 2.2 秒,钟声 32KB / 3.6 秒
+        const buf = { kind: bell ? "bell" : "cash", duration: bell ? 3.648 : 2.232 };
         return Promise.resolve().then(() => { if(ok) ok(buf); return buf; });
       }
       createBufferSource(){
         const ctx = this;
         return { buffer: null, connect(){},
-          start(when){ this._rec = { kind: this.buffer.kind, at: when, bornAt: ctx.bornAt }; window.__sounds.push(this._rec); },
+          start(when){ this._rec = { kind: this.buffer.kind, at: when, dur: this.buffer.duration, ctx: window.__contexts.indexOf(ctx) }; window.__sounds.push(this._rec); },
           stop(){ if(this._rec) this._rec.stoppedAt = ctx.currentTime; } };
       }
       createConstantSource(){                                           // 一直输出同一个数:不是 0 就算「在出声」
@@ -44,8 +55,9 @@ async function recordSounds(page){
   });
 }
 
-// Safari 的规矩(2026-10-28/29 本机系统日志):窗口连续看不见满 8 分钟、页面又已经静了 10 秒,整个网页进程就被冻结;
-// 冻结时什么都不跑,恢复后原来那个音频引擎看着在跑、其实再也出不了声。
+// Safari 的规矩(2026-10-28/29、11-10 本机系统日志 + WebKit 源码):窗口连续看不见满 8 分钟(有时只要 10 秒)、页面又已经静了 10 秒,
+// 整个网页进程就被冻结。冻结那一刻系统音频输出要是开着(有引擎在 running),那条输出就坏了:之后排到它上面的声音全哑,
+// 换新引擎、刷新页面都没用(同一采样率的引擎共用那条输出),只有退出 app 才好;输出关着时被冻结则没事。
 // 这里故意用更严的「看不见 + 静了 10 秒就冻」:冻得只会比真机早、比真机多,在这里能响,真机上一定能响
 const FREEZE_AFTER_SEC = 10, SOUND_SEC = 2;
 function freezeTimes({ sounds, outputs, visibility, now }){
@@ -61,16 +73,29 @@ function freezeTimes({ sounds, outputs, visibility, now }){
   }
   return freezes;
 }
+const stateAt = (ctx, t) => ctx.states.reduce((s, x) => x.t <= t ? x.state : s, "suspended");
+const runningThrough = (ctx, from, to) => stateAt(ctx, from) === "running" && !ctx.states.some(x => x.t > from && x.t < to && x.state !== "running");
 
-// 到目前为止用户实际听到的声音:时刻已到、没在响之前被取消、引擎也没被冻结弄哑;时刻换算成「距点开始那一声几秒」
+// 到目前为止用户实际听到的声音:时刻已到、没在响之前被取消、从头到尾引擎都开着、那条输出也没被冻结弄坏;时刻换算成「距点开始那一声几秒」
 async function heardSounds(page){
   const rec = await page.evaluate(() => ({
     sounds: window.__sounds, visibility: window.__visibility, now: performance.now() / 1000,
+    contexts: window.__contexts.map(c => ({ rate: c.sampleRate, states: c.states })),
     outputs: window.__outputs.map(o => ({ from: o.from, to: o.to ?? o.ctx.closedAt, level: o.node.offset.value })) }));
-  const freezes = freezeTimes(rec), t0 = rec.sounds[0].at;
-  return rec.sounds.filter(s => s.at <= rec.now && (s.stoppedAt === undefined || s.stoppedAt > s.at)
-                             && !freezes.some(f => s.bornAt < f && f <= s.at))   // 冻结前就在的引擎,冻结之后排到的声音全哑
-                   .map(s => [s.kind, Math.round(s.at - t0)]);
+  const broken = [];                                                    // 冻结那一刻开着的输出 {rate, at}:从此坏掉
+  freezeTimes(rec).forEach(f => rec.contexts.forEach(c => { if(stateAt(c, f) === "running") broken.push({ rate: c.rate, at: f }); }));
+  const t0 = rec.sounds[0].at;
+  return rec.sounds.filter(s => {
+    const ctx = rec.contexts[s.ctx];
+    return s.at <= rec.now && (s.stoppedAt === undefined || s.stoppedAt > s.at)
+        && runningThrough(ctx, s.at, Math.min(s.at + s.dur, rec.now))      // 响到一半引擎被关 = 被掐断,不算听到
+        && !broken.some(b => b.rate === ctx.rate && b.at <= s.at);
+  }).map(s => [s.kind, Math.round(s.at - t0)]);
+}
+
+// 此刻有没有引擎开着(开着 = 系统音频输出开着;这时网页被冻结,那条输出就会坏)
+async function audioOutputOn(page){
+  return page.evaluate(() => window.__contexts.some(c => c.state === "running"));
 }
 
 // 跟用户一样从设置面板改参数(专注时长调短,让模拟跑得快)
@@ -311,4 +336,87 @@ test("暂停后窗口藏过,回来在设置里试听点钞,照样能听到", asy
   await page.click("#testCash");                      // 第 40 秒试听
 
   expect(await heardSounds(page)).toEqual([["cash", 0], ["cash", 40]]);
+});
+
+// 2026-11-10 真机:第 2 轮专注走到 22:35 暂停,切走很久(Mac 还睡了一觉),回来点开始,当场那声点钞就没响
+test("专注 20 多分钟暂停、切走很久,回来点开始,当场的点钞和之后的提示音照样响", async ({ page }) => {
+  test.setTimeout(180_000);                           // 真走 36 分钟,约 1 分钟
+  await recordSounds(page);
+  await openApp(page);
+  await configure(page, { minInterval: 5, maxInterval: 5, focusMin: 40, eyeSec: 7 });
+  await page.click("#playBtn");
+  await page.clock.runFor("22:35");
+  await page.click("#playBtn");                       // 暂停(专注第 1355 秒)
+  await hideWindow(page);                             // 切走:暂停中藏 10 秒 Safari 就可能冻结网页
+  await page.clock.runFor("14:00");
+  await showWindow(page);
+  await page.click("#playBtn");                       // 墙上第 2195 秒继续
+  await page.clock.runFor("06:00");
+
+  expect(await heardSounds(page)).toEqual([
+    ["cash", 0],
+    ["cash", 300], ["cash", 307], ["cash", 607], ["cash", 614],
+    ["cash", 914], ["cash", 921], ["cash", 1221], ["cash", 1228],
+    ["cash", 2195],                                   // 继续:当场那声点钞
+    ["cash", 2368], ["cash", 2375],                   // 专注第 1528 秒那组
+  ]);
+});
+
+test("不计时的时候(刚打开、暂停、试听完、全部结束)系统音频输出都关着,Safari 冻结页面也弄不坏它", async ({ page }) => {
+  await recordSounds(page);
+  await openApp(page);
+  await page.clock.runFor("00:01");
+  expect(await audioOutputOn(page)).toBe(false);      // 刚打开
+
+  await configure(page, { minInterval: 10, maxInterval: 10, focusMin: 5, bigRestMin: 1, rounds: 1 });
+  await page.click("#playBtn");
+  expect(await audioOutputOn(page)).toBe(true);       // 计时中开着(保活)
+  await page.clock.runFor("00:10");
+  await page.click("#playBtn");                       // 暂停
+  await page.clock.runFor("00:01");
+  expect(await audioOutputOn(page)).toBe(false);
+
+  await page.click("#gear");
+  await page.click("#testBell");                      // 试听钟声(3.6 秒)
+  await page.clock.runFor("00:02");
+  expect(await audioOutputOn(page)).toBe(true);       // 正在响,不掐断
+  await page.clock.runFor("00:03");
+  expect(await audioOutputOn(page)).toBe(false);      // 响完就关
+  await page.click("#saveSettings");
+
+  await page.click("#playBtn");                       // 继续,跑完唯一一轮
+  await page.clock.runFor("06:00");
+  await expect(page.locator("#phase")).toHaveText("Done");
+  await page.clock.runFor("00:01");
+  expect(await audioOutputOn(page)).toBe(false);
+
+  const heard = (await heardSounds(page)).map(([kind]) => kind);
+  expect(heard.filter(k => k === "bell")).toEqual(["bell", "bell"]);   // 试听那声完整响完 + 专注结束钟声
+});
+
+test("万一输出开着时网页被冻过(关输出没生效),回来点开始换一条新输出,照样响;之后也不再用坏掉的那条", async ({ page }) => {
+  await recordSounds(page);
+  await openApp(page);
+  await configure(page, { minInterval: 1, maxInterval: 1, focusMin: 30, eyeSec: 7 });
+  await page.evaluate(() => { window.__suspendBroken = true; });
+  await page.click("#playBtn");
+  await page.clock.runFor("00:10");
+  await page.click("#playBtn");                       // 暂停,但关输出没生效
+  await hideWindow(page);
+  await page.clock.runFor("00:30");                   // 输出开着时被冻结 → 那条输出坏了
+  await showWindow(page);
+  await page.evaluate(() => { window.__suspendBroken = false; });
+  await page.click("#playBtn");                       // 第 40 秒继续
+  await page.clock.runFor("00:10");
+  await page.click("#playBtn");                       // 第 50 秒暂停
+  await hideWindow(page);
+  await page.clock.runFor("03:00");                   // 空闲 ≥2 分钟,下次点开始会换新引擎
+  await showWindow(page);
+  await page.click("#playBtn");                       // 第 230 秒继续
+  await page.clock.runFor("00:50");
+
+  expect(await heardSounds(page)).toEqual([
+    ["cash", 0], ["cash", 40], ["cash", 230],
+    ["cash", 270], ["cash", 277],                     // 专注第 1:00 那组(暂停的不算)
+  ]);
 });

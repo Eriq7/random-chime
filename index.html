@@ -455,7 +455,22 @@ el.ring.style.strokeDasharray = RING_C;
 let audioCtx=null, master=null, cashBuf=null, bellBuf=null;
 let armed = [];                               // 提前排进音频时钟、还没响的声音 {s, at};暂停/重置时取消
 let keepAlive = null;                         // 计时中一直输出的极小信号:Safari 会冻结「看不见又没在出声」的网页,冻结后排好的声音全哑
-let mayBeFrozen = false;                      // 不计时时窗口藏过 → 网页可能被冻过,旧引擎恢复后多半是哑的;下次点开始/试听换新的
+let mayBeFrozen = false;                      // 不计时时窗口藏过 → 网页可能被冻过;下次点开始/试听换新引擎(保险,见 ensureLiveAudio)
+// 系统音频输出(WebKit 的 GPU 进程里那条 RemoteAudioDestination)开着的时候网页被冻结 ≥2 秒,那条输出就永久哑掉:
+// 输出照常往前读,网页那边冻住没写;恢复后网页一口气补写,写的位置甩开读的位置超过 2 秒缓冲,读的那头再也读不到数据(只出静音)。
+// 同一采样率的引擎全进程共用一条输出,换新引擎、刷新页面都还用它,只有退出 app 才换(2026-11-10 日志 + WebKit 源码)。所以:
+//  ① 不计时就 suspend 引擎,让输出关着(关着时被冻结没事);② 万一输出开着时可能被冻过,换个采样率逼出一条新输出。
+let outputOn = false;                         // 输出可能开着:新引擎 / resume 之后为 true,suspend 生效后才 false
+let audioGen = 0;                             // 每次唤醒 +1:晚到的 suspend 回调别把刚唤醒的输出记成关着
+let riskSince = 0;                            // 「输出开着 + 看不见 + 没保活」从哪一刻开始(performance.now),0 = 不在这种状态
+let zombieRisk = false;                       // 上面这种状态持续过 RISK_MS:那条输出可能已坏,下次点开始/试听换采样率
+let soundEndsAt = 0;                          // 当前引擎上已经开始响的声音最晚几点响完(音频时钟);关输出要等它放完,不掐断
+let quietTimer = null;
+const RISK_MS = 5000;                         // Safari 最快也要藏 10 秒、静 10 秒才冻结,5 秒内关掉输出就不会出事
+const QUIET_PAD_MS = 300;
+const RATE_KEY = "randomChime.audioRate.v1";  // 换过几次输出(0 = 用默认采样率);存起来是因为刷新页面后输出还是那条
+let audioRateSeq = 0;
+try{ audioRateSeq = parseInt(localStorage.getItem(RATE_KEY), 10) || 0; }catch(e){}
 let audioTouchedAt = 0;                       // 最近一次「引擎确实活着」的时刻(建 ctx 或成功发声);用于判断是否需换新引擎
 const REBUILD_IDLE_MS = 120000;              // 空闲≥2分钟再点开始 → 先重建全新音频引擎(旧引擎可能已被系统拆掉,且 state 会撒谎报 running)
 function b64ToArrayBuffer(b64){
@@ -465,9 +480,11 @@ function b64ToArrayBuffer(b64){
 }
 function buildAudio(){                        // 造一个全新引擎(在用户手势内调用即可立刻发声)
   const AC = window.AudioContext || window.webkitAudioContext;
-  audioCtx = new AC();
+  const rate = audioRateSeq ? 44100 + 10 * (1 + (audioRateSeq - 1) % 390) : 0;   // 44110、44120…:每个采样率是一条新输出
+  try{ audioCtx = rate ? new AC({ sampleRate: rate }) : new AC(); }catch(e){ audioCtx = new AC(); }
   master = audioCtx.createGain(); master.gain.value = cfg.volume; master.connect(audioCtx.destination);
   audioTouchedAt = Date.now(); mayBeFrozen = false;
+  zombieRisk = false; riskSince = 0; outputOn = true; soundEndsAt = 0; audioGen++; checkRisk();
   // 挂起状态即可解码,提前备好缓冲,首次点击就能立刻响
   audioCtx.decodeAudioData(b64ToArrayBuffer(CASH_B64), b=>{ cashBuf=b; }, ()=>{});
   audioCtx.decodeAudioData(b64ToArrayBuffer(BELL_B64), b=>{ bellBuf=b; }, ()=>{});
@@ -483,9 +500,34 @@ function rebuildAudio(){                       // 换新引擎:先 close 旧的(
 }
 function ensureLiveAudio(){                    // 点开始/试听时(手势内)调用:旧引擎可能已哑就换新的;计时中不换,免得丢掉排好的声音
   if(st.running) return;
-  if(!audioCtx || mayBeFrozen || Date.now() - audioTouchedAt >= REBUILD_IDLE_MS) rebuildAudio();
+  checkRisk();
+  if(zombieRisk){ audioRateSeq++; try{ localStorage.setItem(RATE_KEY, String(audioRateSeq)); }catch(e){} }   // 输出可能已坏:换采样率 = 换一条新输出
+  if(!audioCtx || mayBeFrozen || zombieRisk || Date.now() - audioTouchedAt >= REBUILD_IDLE_MS) rebuildAudio();
 }
-function unlockAudio(){ initAudio(); if(audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); } }
+function wakeAudio(){                          // 打开输出(resume);只在点开始 / 试听 / 计时中调用
+  outputOn = true; audioGen++; checkRisk();
+  return Promise.resolve(audioCtx.resume());
+}
+function quietAudio(){                         // 不计时:等正在响的那声放完,就 suspend 引擎 → 输出关掉;WebKit 不会自己再打开被页面 suspend 的引擎
+  clearTimeout(quietTimer); quietTimer = null;
+  if(st.running || !audioCtx) return;
+  const wait = Math.max(0, soundEndsAt - audioCtx.currentTime);
+  quietTimer = setTimeout(() => {
+    quietTimer = null;
+    const ctx = audioCtx, gen = audioGen;
+    if(st.running || !ctx || ctx.state === "closed") return;
+    if(soundEndsAt - ctx.currentTime > 0.05){ quietAudio(); return; }   // 这期间又响了一声(连点试听)
+    Promise.resolve(ctx.suspend()).then(() => {
+      if(ctx === audioCtx && gen === audioGen && !st.running){ outputOn = false; checkRisk(); }
+    }).catch(()=>{});
+  }, wait * 1000 + QUIET_PAD_MS);
+}
+function checkRisk(){                          // 在每个可能改变「输出开着 / 看不见 / 保活」的时刻调用
+  const now = performance.now(), risky = outputOn && document.hidden && !keepAlive;
+  if(riskSince && now - riskSince >= RISK_MS) zombieRisk = true;      // 网页被冻住时这里不跑;恢复后第一次调用就补上
+  riskSince = risky ? (riskSince || now) : 0;
+}
+function unlockAudio(){ initAudio(); if(audioCtx.state !== "running"){ wakeAudio().catch(()=>{}); } }
 function playBuf(buf, delaySec){
   if(!audioCtx || !buf) return;
   const doPlay = () => {
@@ -495,17 +537,21 @@ function playBuf(buf, delaySec){
     const s = audioCtx.createBufferSource(); s.buffer = buf; s.connect(master);
     const at = audioCtx.currentTime + (delaySec > 0 ? delaySec : 0);
     s.start(at);                                                     // 由音频线程精确排期,不靠主线程 tick
-    if(delaySec > 0) armed.push({ s, at });
+    const end = at + (buf.duration || 0);
+    if(delaySec > 0) armed.push({ s, at, end });
+    else soundEndsAt = Math.max(soundEndsAt, end);
     audioTouchedAt = Date.now();                                     // 真正发过声 → 刷新「引擎活着」时刻
+    if(!st.running) quietAudio();                                    // 试听:响完就关输出
   };
   if(audioCtx.state === "running"){ doPlay(); }
-  else { (audioCtx.resume() || Promise.resolve()).then(doPlay).catch(()=>{}); }
+  else { wakeAudio().then(doPlay).catch(()=>{}); }
 }
-function disarmSounds(){                       // 取消还没响的(正在响的那声不打断),并停掉保活
+function disarmSounds(){                       // 取消还没响的(正在响的那声不打断),停掉保活;不在计时就关输出
   const now = audioCtx ? audioCtx.currentTime : 0;
-  armed.forEach(a => { if(a.at > now){ try{ a.s.stop(); }catch(e){} } });
+  armed.forEach(a => { if(a.at > now){ try{ a.s.stop(); }catch(e){} } else soundEndsAt = Math.max(soundEndsAt, a.end); });
   armed = [];
   stopKeepAlive();
+  quietAudio();
 }
 function startKeepAlive(){                     // -80 dB 的直流,人耳听不见;但不是 0,WebKit 就认定页面在出声、不冻结它
   if(keepAlive || !audioCtx) return;
@@ -515,8 +561,9 @@ function startKeepAlive(){                     // -80 dB 的直流,人耳听不�
     keepAlive.connect(audioCtx.destination);   // 不经过音量(master):音量调到 0 也照样保活
     keepAlive.start();
   }catch(e){ keepAlive = null; }
+  checkRisk();
 }
-function stopKeepAlive(){ if(keepAlive){ try{ keepAlive.stop(); }catch(e){} keepAlive = null; } noteHidden(); }
+function stopKeepAlive(){ if(keepAlive){ try{ keepAlive.stop(); }catch(e){} keepAlive = null; } noteHidden(); checkRisk(); }
 function noteHidden(){ if(document.hidden && !keepAlive) mayBeFrozen = true; }   // 看不见又没保活 → 连续藏满 8 分钟 Safari 就冻结网页;保守起见藏过就算
 function playCash(){ playBuf(cashBuf); }
 function playBell(){ playBuf(bellBuf); }
@@ -612,7 +659,7 @@ function start(){
   if(audioCtx && audioCtx.state !== "running"){         // 最终兜底:连新引擎都唤不醒 = 真·设备死 → 整页刷新(进度已存,再点一次即出声)
     setTimeout(() => {
       if(!audioCtx || audioCtx.state === "running") return;
-      (audioCtx.resume() || Promise.resolve()).catch(()=>{});
+      wakeAudio().catch(()=>{});
       setTimeout(() => { if(audioCtx && audioCtx.state !== "running") hardReload(); }, 600);
     }, 600);
   }
@@ -806,13 +853,14 @@ $("testBell").addEventListener("click", () => { ensureLiveAudio(); unlockAudio()
 $("volume").addEventListener("input", () => { if(master) master.gain.value = parseFloat(sEl.volume.value); });
 
 document.addEventListener("visibilitychange", () => {
+  checkRisk();
   if(document.visibilityState === "hidden"){ noteHidden(); saveSession(); return; }            // 进入后台:存档;不在计时就记下「可能被冻」
-  if(audioCtx && audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); }  // 回前台:短暂离开 resume 常能救活
+  if(st.running && audioCtx && audioCtx.state !== "running"){ wakeAudio().catch(()=>{}); }     // 回前台:计时中才唤醒;不计时让输出关着
   if(st.running) tick();
   requestSync();                                                                               // 回前台:补传没传上的、拉别的设备上的新记录
 });
 window.addEventListener("pageshow", () => {                       // 覆盖 BFCache/PWA 恢复
-  if(audioCtx && audioCtx.state !== "running"){ (audioCtx.resume() || Promise.resolve()).catch(()=>{}); }
+  if(st.running && audioCtx && audioCtx.state !== "running"){ wakeAudio().catch(()=>{}); }
 });
 window.addEventListener("pagehide", () => { saveSession(); });
 document.addEventListener("keydown", e => {
@@ -822,6 +870,7 @@ document.addEventListener("keydown", e => {
 
 /* ---------------- init ---------------- */
 initAudio();          // 提前建好(挂起)音频上下文并解码,首次点击即可发声
+quietAudio();         // 不计时:输出关着,点开始时再在手势内打开
 noteHidden();         // 一打开就在后台(看不见):可能马上被冻,点开始时换新引擎
 const _saved = loadSession();
 if(_saved){ st = _saved.st; autoPaused = !!_saved.autoPaused; st.running = false; logFocus(_saved.savedAt); }  // 还原上次进度为「暂停」态(刷新后不丢 26/40);计时中直接关掉 app 的那段补记上
